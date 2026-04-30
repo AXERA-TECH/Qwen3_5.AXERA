@@ -54,6 +54,7 @@ MODEL_INPUT_KEYS = {
 #     "What can be directly observed in this image? Answer conservatively and avoid speculation.",
 # ]
 
+# 中英文混合量化效果不好
 COCO_PROMPTS = [
     "Describe only what is clearly visible in the image in one or two concise sentences. Do not infer relationships, location, time, emotions, or hidden details.",
     "Give a concise, grounded caption for the image. Avoid adding details that are not visually evident.",
