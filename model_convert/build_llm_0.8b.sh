@@ -1,8 +1,8 @@
 set -e
 export FLOAT_MATMUL_USE_CONV_EU=1 
 
-INPUT_DIR=/data/tmp/yongqiang/nfs/lhj/Qwen/Qwen3.5-0.8B-GPTQ-Int4-EN
-OUTPUT_DIR=/data/tmp/yongqiang/nfs/lhj/Qwen3_5.AXERA/ax-llm/Qwen3.5-0.8B-GPTQ-Int4-AX650-C128-P1280-CTX2047-EN
+INPUT_DIR=../../Qwen/Qwen3.5-0.8B-GPTQ-Int4-EN
+OUTPUT_DIR=../../Qwen3_5.AXERA/ax-llm/Qwen3.5-0.8B-GPTQ-Int4-AX650-C128-P1280-CTX2047-EN
 pulsar2 llm_build --input_path $INPUT_DIR \
                 --output_path  $OUTPUT_DIR \
                 --kv_cache_len 2047 \

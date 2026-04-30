@@ -1,8 +1,8 @@
 set -e
 export FLOAT_MATMUL_USE_CONV_EU=1 
 
-# INPUT_DIR=/data/tmp/yongqiang/nfs/lhj/Qwen/Qwen3.5-2B-GPTQ-Int4-EN-0
-# OUTPUT_DIR=/data/tmp/yongqiang/nfs/lhj/Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-AX650-GPTQ-Int4-C128-P1152-CTX2047-EN-0
+# INPUT_DIR=../../Qwen/Qwen3.5-2B-GPTQ-Int4-EN-0
+# OUTPUT_DIR=../../Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-AX650-GPTQ-Int4-C128-P1152-CTX2047-EN-0
 # pulsar2 llm_build --input_path $INPUT_DIR \
 #                 --output_path  $OUTPUT_DIR \
 #                 --kv_cache_len 2047 \
@@ -23,8 +23,8 @@ export FLOAT_MATMUL_USE_CONV_EU=1
 # tools/embed_process.sh $INPUT_DIR $OUTPUT_DIR
 
 
-INPUT_DIR=/data/tmp/yongqiang/nfs/lhj/Qwen/Qwen3.5-2B-GPTQ-Int4-EN-1
-OUTPUT_DIR=/data/tmp/yongqiang/nfs/lhj/Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-AX650-GPTQ-Int4-C128-P1152-CTX2047-EN-1
+INPUT_DIR=../../Qwen/Qwen3.5-2B-GPTQ-Int4-EN-1
+OUTPUT_DIR=../../Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-AX650-GPTQ-Int4-C128-P1152-CTX2047-EN-1
 pulsar2 llm_build --input_path $INPUT_DIR \
                 --output_path  $OUTPUT_DIR \
                 --kv_cache_len 2047 \
