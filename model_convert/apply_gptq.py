@@ -31,7 +31,23 @@ ADD_GENERATION_PROMPT = os.environ.get("ADD_GENERATION_PROMPT", "1") not in {"0"
 
 MODEL_DEVICE = os.environ.get("MODEL_DEVICE", "cuda:0")
 CALIBRATION_DEVICE = os.environ.get("CALIBRATION_DEVICE", MODEL_DEVICE)
+PRECOMPUTE_INPUTS_DEVICE = os.environ.get("PRECOMPUTE_INPUTS_DEVICE", CALIBRATION_DEVICE)
+RELEASE_PRECOMPUTE_MODULES = os.environ.get("RELEASE_PRECOMPUTE_MODULES", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+CALIBRATION_CACHE_PATH = os.environ.get("CALIBRATION_CACHE_PATH", "").strip()
+ENABLE_DYNAMIC_QUANT_CONFIG = os.environ.get("ENABLE_DYNAMIC_QUANT_CONFIG", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 SKIP_LINEAR_ATTN_FIRST_N = int(os.environ.get("SKIP_LINEAR_ATTN_FIRST_N", "3"))
+
+_PREPARED_CALIBRATION_DATASET: List[Dict[str, torch.Tensor]] | None = None
 
 MODEL_INPUT_KEYS = {
     "input_ids",
@@ -63,6 +79,9 @@ COCO_PROMPTS = [
 
 
 def _build_dynamic_quant_config() -> Dict[str, Dict[str, Any]] | None:
+    if not ENABLE_DYNAMIC_QUANT_CONFIG:
+        return None
+
     if SKIP_LINEAR_ATTN_FIRST_N <= 0:
         return None
 
@@ -71,6 +90,69 @@ def _build_dynamic_quant_config() -> Dict[str, Dict[str, Any]] | None:
         f"-:^model\\.language_model\\.layers\\.(?:{skip_layers})"
         r"\.linear_attn\.(?:in_proj_qkv|in_proj_z|out_proj)$": {},
     }
+
+
+def _has_calibration_cache() -> bool:
+    return bool(CALIBRATION_CACHE_PATH) and os.path.exists(CALIBRATION_CACHE_PATH)
+
+
+def _load_calibration_cache() -> List[Dict[str, torch.Tensor]] | None:
+    if not _has_calibration_cache():
+        return None
+
+    print(f"loading prepared calibration cache: {CALIBRATION_CACHE_PATH}")
+    try:
+        cache = torch.load(CALIBRATION_CACHE_PATH, map_location="cpu", weights_only=False)
+    except TypeError:
+        cache = torch.load(CALIBRATION_CACHE_PATH, map_location="cpu")
+
+    if isinstance(cache, dict) and "encoded_batches" in cache:
+        encoded_batches = cache["encoded_batches"]
+    else:
+        encoded_batches = cache
+
+    if not isinstance(encoded_batches, list) or not encoded_batches:
+        raise ValueError(f"invalid calibration cache: {CALIBRATION_CACHE_PATH}")
+
+    print(f"loaded {len(encoded_batches)} prepared calibration batches from cache")
+    return encoded_batches
+
+
+def _save_calibration_cache(encoded_batches: List[Dict[str, torch.Tensor]]) -> None:
+    if not CALIBRATION_CACHE_PATH or _has_calibration_cache():
+        return
+
+    cache_dir = os.path.dirname(CALIBRATION_CACHE_PATH)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    tmp_path = f"{CALIBRATION_CACHE_PATH}.tmp"
+    cache = {
+        "metadata": {
+            "model_id": MODEL_ID,
+            "num_calib": NUM_CALIB,
+            "num_coco_calib": NUM_COCO_CALIB,
+            "max_text_chars": MAX_TEXT_CHARS,
+            "add_generation_prompt": ADD_GENERATION_PROMPT,
+            "coco_caption_data_files": COCO_CAPTION_DATA_FILES,
+        },
+        "encoded_batches": encoded_batches,
+    }
+    torch.save(cache, tmp_path)
+    os.replace(tmp_path, CALIBRATION_CACHE_PATH)
+    print(f"saved prepared calibration cache: {CALIBRATION_CACHE_PATH}")
+
+
+def _build_cached_calibration_placeholder() -> List[Dict[str, Any]]:
+    placeholder = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "cached calibration placeholder"}],
+            }
+        ]
+    }
+    return [placeholder for _ in range(max(NUM_CALIB, 256))]
 
 
 def _load_wikipedia_stream(config_name: str, seed: int):
@@ -256,12 +338,32 @@ def _module_device(module: torch.nn.Module) -> torch.device:
     return torch.device("cpu")
 
 
+def _materialize_precompute_modules(qmodel) -> None:
+    if getattr(qmodel, "_qwen3_5_precompute_modules_ready", False):
+        return
+
+    device = torch.device(PRECOMPUTE_INPUTS_DEVICE)
+    base_model = qmodel.model.model
+    print(f"materializing embed/visual modules on {device} for calibration precompute")
+    qmodel.shell_module_materialize(base_model.get_input_embeddings(), device)
+    qmodel.shell_module_materialize(base_model.visual, device)
+    qmodel._qwen3_5_precompute_modules_ready = True
+
+
+def _release_precompute_modules(qmodel) -> None:
+    if not RELEASE_PRECOMPUTE_MODULES:
+        return
+
+    base_model = qmodel.model.model
+    qmodel.shell_module_materialize(base_model.get_input_embeddings(), torch.device("cpu"))
+    qmodel.shell_module_materialize(base_model.visual, torch.device("cpu"))
+    qmodel._qwen3_5_precompute_modules_ready = False
+
+
 def _precompute_inputs_embeds(qmodel, encoded: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     model = qmodel.model
     base_model = model.model
     embed_tokens = base_model.get_input_embeddings()
-    qmodel.shell_module_materialize(embed_tokens, torch.device("cpu"))
-    qmodel.shell_module_materialize(base_model.visual, torch.device("cpu"))
     text_device = _module_device(embed_tokens)
 
     input_ids = encoded["input_ids"].to(text_device)
@@ -333,7 +435,18 @@ def _prepare_mixed_calibration_dataset(
     calibration_data_min_length=10,
     calibration_concat_separator=None,
 ):
+    global _PREPARED_CALIBRATION_DATASET
+
     del calibration_dataset_concat_size, calibration_concat_separator
+
+    if _PREPARED_CALIBRATION_DATASET is not None:
+        print("reusing prepared calibration batches from memory")
+        return _PREPARED_CALIBRATION_DATASET
+
+    cached_batches = _load_calibration_cache()
+    if cached_batches is not None:
+        _PREPARED_CALIBRATION_DATASET = cached_batches
+        return cached_batches
 
     if batch_size != 1:
         print("multimodal calibration keeps one sample per batch; ignoring batch_size > 1")
@@ -341,6 +454,8 @@ def _prepare_mixed_calibration_dataset(
     processor = getattr(qmodel, "processor", None) or getattr(qmodel, "tokenizer", None)
     if processor is None:
         raise RuntimeError("Qwen3.5 multimodal calibration requires model.processor or model.tokenizer.")
+
+    _materialize_precompute_modules(qmodel)
 
     encoded_batches: List[Dict[str, torch.Tensor]] = []
     skipped = 0
@@ -392,15 +507,24 @@ def _prepare_mixed_calibration_dataset(
         f"prepared {len(encoded_batches)} one-sample calibration batches "
         f"({image_batches} with images precomputed into inputs_embeds, {total_tokens} non-padded tokens)"
     )
+    _save_calibration_cache(encoded_batches)
+    _PREPARED_CALIBRATION_DATASET = encoded_batches
+    _release_precompute_modules(qmodel)
     return encoded_batches
 
 
-calibration_dataset = build_calibration_dataset(NUM_CALIB)
+calibration_dataset = (
+    _build_cached_calibration_placeholder()
+    if _has_calibration_cache()
+    else build_calibration_dataset(NUM_CALIB)
+)
 print(f"ready to quantize with {len(calibration_dataset)} mixed calibration samples")
 
 dynamic_quant_config = _build_dynamic_quant_config()
 if dynamic_quant_config:
     print(f"dynamic quant skip rules: {dynamic_quant_config}")
+elif not ENABLE_DYNAMIC_QUANT_CONFIG:
+    print("dynamic quant skip rules disabled by ENABLE_DYNAMIC_QUANT_CONFIG")
 
 quant_config = QuantizeConfig(
     bits=4,
