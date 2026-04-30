@@ -9,7 +9,7 @@ from gptqmodel import GPTQModel, QuantizeConfig
 
 
 MODEL_ID = os.environ.get("MODEL_ID", "../../Qwen/Qwen3.5-0.8B/")
-QUANT_PATH = os.environ.get("QUANT_PATH", "../../Qwen/Qwen3.5-0.8B-GPTQ-Int4-EN")  #linear attn 不做gptq量化, 修改了/home/lihongjie/miniforge-pypy3/envs/llm/lib/python3.12/site-packages/gptqmodel/models/definitions/qwen3_5.py， 
+QUANT_PATH = os.environ.get("QUANT_PATH", "../../Qwen/Qwen3.5-0.8B-GPTQ-Int4-EN")  
 
 WIKI_DATASET_ID = os.environ.get("WIKI_DATASET_ID", "wikimedia/wikipedia")
 WIKI_EN_CONFIG = os.environ.get("WIKI_EN_CONFIG", "20231101.en")
