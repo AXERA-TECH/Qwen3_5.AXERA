@@ -1,0 +1,10 @@
+GPTQModel==6.0.3 
+transformers==5.4.0
+onnx==1.17.0
+onnxruntime==1.20.1
+onnxsim
+opencv-python
+torch
+torchvision
+accelerate
+qwen_vl_utils
