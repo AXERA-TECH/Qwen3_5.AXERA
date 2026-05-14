@@ -64,42 +64,53 @@ Vision Encoder 和 Language Model 编译还需要可用的 `pulsar2` 工具链�
 - `sym=True`
 - `mse=2.5`
 
-量化数据由 Wikipedia 文本和 COCO Caption 图文样本混合构成，默认会读取本目录下的 `val-00001-of-00013.parquet`。
+量化数据由 Wikipedia 文本和 COCO Caption 图文样本混合构成。Wikipedia 默认从 ModelScope 的 `wikimedia/wikipedia` 流式读取，COCO Caption 默认读取本目录下的 `val-00001-of-00013.parquet`。
 
 示例：
 
 ```bash
 export CUDA_VISIBLE_DEVICES=1
 export MODEL_ID=../../Qwen/Qwen3.5-2B/
-export QUANT_PATH=../../Qwen/Qwen3.5-2B-GPTQ-Int4-EN
+export TARGET_LANGUAGE=zh
+export QUANT_PATH=../../Qwen/Qwen3.5-2B-GPTQ-Int4-ZH
 python apply_gptq.py | tee apply_gptq.log
 ```
 
 常用环境变量：
 
 - `NUM_CALIB`：总校准样本数，默认 `1024`。
-- `NUM_COCO_CALIB`：图文样本数，默认约为总数的 `3/4`。
+- `NUM_COCO_CALIB`：图文样本数；`TARGET_LANGUAGE=zh` 时默认约为总数的 `1/2`，给中文文本/回答 token 留出更多校准比例。
+- `TARGET_LANGUAGE`：目标输出语言，默认 `zh`；中文场景会默认使用更多中文 Wikipedia 文本和中文图文 prompt。
+- `TEXT_LANGUAGE_PATTERN`：纯文本样本语言轮转，中文默认 `zh,zh,en`。
+- `COCO_PROMPT_PATTERN`：图文 prompt 语言轮转，中文默认 `zh,zh,en`。
+- `TEXT_AS_ASSISTANT`：是否把纯文本样本拆成 user/assistant 续写格式，默认 `1`，用于让校准覆盖中文输出 token。
+- `WIKI_DATA_SOURCE`：Wikipedia 数据源，默认 `modelscope`；可设为 `huggingface` 或 `hf` 切回 HuggingFace。
+- `WIKI_DATASET_ID`：Wikipedia 数据集 ID，默认 `wikimedia/wikipedia`。
+- `WIKI_EN_CONFIG` / `WIKI_ZH_CONFIG`：Wikipedia 子集配置，默认分别使用 `20231101.en` / `20231101.zh`。
+- `MODELSCOPE_DATASET_CACHE_DIR`：ModelScope 数据集缓存目录，默认使用 ModelScope SDK 默认缓存。
 - `COCO_CAPTION_DATA_FILES`：COCO Caption parquet 路径，默认 `val-00001-of-00013.parquet`。
 - `MODEL_DEVICE`：模型加载设备，默认 `cuda:0`。
 - `CALIBRATION_DEVICE`：校准数据设备，默认同 `MODEL_DEVICE`。
 - `PRECOMPUTE_INPUTS_DEVICE`：预计算 `inputs_embeds` 和视觉特征的设备，默认同 `CALIBRATION_DEVICE`。显存足够时建议用 `cuda:0`，比 CPU 快很多。
 - `RELEASE_PRECOMPUTE_MODULES`：预计算结束后是否把 embedding/vision 模块移回 CPU，默认 `1`，可减少后续量化显存占用。
-- `CALIBRATION_CACHE_PATH`：预处理后校准 batch 的缓存路径，例如 `cache/qwen3_5_2b_calib_1024.pt`。第二次运行会跳过 Wikipedia/COCO 采样和视觉特征预计算。
+- `CALIBRATION_CACHE_PATH`：预处理后校准 batch 的缓存路径，例如 `cache/qwen3_5_2b_calib_1024_zh.pt`。第二次运行会跳过 Wikipedia/COCO 采样和视觉特征预计算。
+- `STRICT_CALIBRATION_CACHE`：是否校验缓存元数据，默认 `1`；避免复用旧英文校准缓存。
+- `OVERWRITE_CALIBRATION_CACHE`：是否强制重建并覆盖缓存，默认 `0`。
 - `ENABLE_DYNAMIC_QUANT_CONFIG`：是否启用 `dynamic_quant_config`，默认 `1`；设为 `0`、`false`、`no` 或 `off` 可禁用。
-- `SKIP_LINEAR_ATTN_FIRST_N`：跳过前 N 层 linear attention 的动态量化规则，默认 `3`。
+- `SKIP_LINEAR_ATTN_FIRST_N`：跳过前 N 层 linear attention 的动态量化规则，默认 `4`。
 
 反复调量化参数时建议开启缓存：
 
 ```bash
 export PRECOMPUTE_INPUTS_DEVICE=cuda:0
-export CALIBRATION_CACHE_PATH=cache/qwen3_5_2b_calib_1024.pt
+export CALIBRATION_CACHE_PATH=cache/qwen3_5_2b_calib_1024_zh.pt
 python apply_gptq.py | tee apply_gptq.log
 ```
 
 如果只想先快速验证流程，可临时减小样本数：
 
 ```bash
-NUM_CALIB=256 NUM_COCO_CALIB=192 python apply_gptq.py
+NUM_CALIB=256 NUM_COCO_CALIB=128 python apply_gptq.py
 ```
 
 更多量化效果排查建议见 `GPTQ_OPTIMIZATION.md`。
