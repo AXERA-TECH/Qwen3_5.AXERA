@@ -4,6 +4,8 @@
 export CUDA_VISIBLE_DEVICES=1,2
 export ENABLE_DYNAMIC_QUANT_CONFIG=1
 export TARGET_LANGUAGE=zh
+export CALIBRATION_ENABLE_THINKING=0
+export NO_THINKING_CALIB_RATIO=0.75
 export WIKI_ZH_CONFIG=20231101.zh
 export TEXT_LANGUAGE_PATTERN=zh,zh,en
 export COCO_PROMPT_PATTERN=zh,zh,en
@@ -58,7 +60,7 @@ export COCO_TRANSLATION_DEVICE=cuda:1
 export RELEASE_TRANSLATION_MODEL=1
 export CALIBRATION_CACHE_PATH=cache/qwen3_5_2b_calib_1024_vqa_zh_1.pt
 export MODEL_ID=../../Qwen/Qwen3.5-2B/
-export QUANT_PATH=../../Qwen/Qwen3.5-2B-GPTQ-Int4-ZH-1
+export QUANT_PATH=../../Qwen/Qwen3.5-2B-GPTQ-Int4-ZH-1-NoThink
 nohup python apply_gptq.py > apply_gptq_2b_1.log &
 
 

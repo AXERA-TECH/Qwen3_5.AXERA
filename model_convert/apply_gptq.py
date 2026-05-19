@@ -3,7 +3,7 @@ import base64
 import gc
 from io import BytesIO
 from types import MethodType
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -70,6 +70,8 @@ DEFAULT_NUM_LANGUAGE_CALIB = min(max(32, NUM_CALIB // 16), max(1, NUM_CALIB // 8
 NUM_LANGUAGE_CALIB = int(os.environ.get("NUM_LANGUAGE_CALIB", str(DEFAULT_NUM_LANGUAGE_CALIB)))
 COCO_CAPTION_STRATEGY = os.environ.get("COCO_CAPTION_STRATEGY", "grounded").strip().lower()
 ADD_GENERATION_PROMPT = _env_bool("ADD_GENERATION_PROMPT", "1")
+CALIBRATION_ENABLE_THINKING = _env_bool("CALIBRATION_ENABLE_THINKING", "0")
+NO_THINKING_CALIB_RATIO = float(os.environ.get("NO_THINKING_CALIB_RATIO", "0.75"))
 TEXT_LANGUAGE_PATTERN = _normalize_language_pattern(
     _split_csv(os.environ.get("TEXT_LANGUAGE_PATTERN", "zh,zh,en" if PREFER_CHINESE else "zh,en")),
     ["zh", "zh", "en"] if PREFER_CHINESE else ["zh", "en"],
@@ -295,6 +297,12 @@ def _build_translation_prompt(text: str, prompt_template: str) -> str:
     return prompt_template.format(text)
 
 
+def _calibration_chat_template_kwargs(enable_thinking: Optional[bool] = None) -> Dict[str, Any]:
+    if enable_thinking is None:
+        enable_thinking = CALIBRATION_ENABLE_THINKING
+    return {"enable_thinking": enable_thinking}
+
+
 def _build_translation_input(tokenizer, text: str, prompt_template: str) -> Dict[str, torch.Tensor]:
     prompt = _build_translation_prompt(text, prompt_template)
     messages = [{"role": "user", "content": prompt}]
@@ -306,6 +314,7 @@ def _build_translation_input(tokenizer, text: str, prompt_template: str) -> Dict
             add_generation_prompt=COCO_TRANSLATION_ADD_GENERATION_PROMPT,
             return_dict=True,
             return_tensors="pt",
+            **_calibration_chat_template_kwargs(),
         )
     else:
         encoded = tokenizer(prompt, return_tensors="pt")
@@ -372,7 +381,7 @@ def _has_calibration_cache() -> bool:
 
 def _calibration_cache_metadata() -> Dict[str, Any]:
     return {
-        "cache_version": 5,
+        "cache_version": 7,
         "model_id": MODEL_ID,
         "target_language": TARGET_LANGUAGE,
         "num_calib": NUM_CALIB,
@@ -382,6 +391,8 @@ def _calibration_cache_metadata() -> Dict[str, Any]:
         "min_text_chars": MIN_TEXT_CHARS,
         "max_text_chars": MAX_TEXT_CHARS,
         "add_generation_prompt": ADD_GENERATION_PROMPT,
+        "calibration_enable_thinking": CALIBRATION_ENABLE_THINKING,
+        "no_thinking_calib_ratio": NO_THINKING_CALIB_RATIO,
         "text_language_pattern": TEXT_LANGUAGE_PATTERN,
         "coco_prompt_pattern": COCO_PROMPT_PATTERN,
         "vqa_prompt_pattern": VQA_PROMPT_PATTERN,
@@ -1107,6 +1118,25 @@ def build_calibration_dataset(num_samples: int) -> List[Dict[str, Any]]:
         f"coco langs [{_language_counts(coco_dataset)}], "
         f"language langs [{_language_counts(language_dataset)}]"
     )
+
+    no_thinking_count = 0
+    if NO_THINKING_CALIB_RATIO > 0:
+        for idx, sample in enumerate(calibration_dataset):
+            if not _should_use_no_thinking(idx):
+                continue
+            messages = sample.get("messages")
+            if isinstance(messages, list):
+                stripped_messages = _strip_assistant_messages(messages)
+                if stripped_messages:
+                    sample["messages"] = stripped_messages
+                    sample["calibration_mode"] = "no_thinking"
+                    no_thinking_count += 1
+
+    if no_thinking_count:
+        print(
+            f"converted {no_thinking_count}/{len(calibration_dataset)} calibration samples "
+            f"to no-thinking prompts (ratio={NO_THINKING_CALIB_RATIO:.2f})"
+        )
     return calibration_dataset
 
 
@@ -1118,6 +1148,22 @@ def _build_or_reuse_calibration_dataset(num_samples: int) -> List[Dict[str, Any]
 
 def _has_assistant_message(messages: List[Dict[str, Any]]) -> bool:
     return any(message.get("role") == "assistant" for message in messages)
+
+
+def _strip_assistant_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [dict(message) for message in messages if message.get("role") != "assistant"]
+
+
+def _should_use_no_thinking(sample_index: int) -> bool:
+    ratio = max(0.0, min(1.0, NO_THINKING_CALIB_RATIO))
+    if ratio <= 0.0:
+        return False
+    if ratio >= 1.0:
+        return True
+    bucket = 1000
+    threshold = int(round(ratio * bucket))
+    hashed = (sample_index * 2654435761) % bucket
+    return hashed < threshold
 
 
 def _module_device(module: torch.nn.Module) -> torch.device:
@@ -1258,13 +1304,21 @@ def _prepare_mixed_calibration_dataset(
         if messages is None:
             text = str(example.get("text", ""))
             messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
+        is_no_thinking_sample = example.get("calibration_mode") == "no_thinking"
+        add_generation_prompt = (
+            True
+            if is_no_thinking_sample
+            else ADD_GENERATION_PROMPT and not _has_assistant_message(messages)
+        )
+        enable_thinking = False if is_no_thinking_sample else None
 
         encoded = processor.apply_chat_template(
             messages,
             tokenize=True,
-            add_generation_prompt=ADD_GENERATION_PROMPT and not _has_assistant_message(messages),
+            add_generation_prompt=add_generation_prompt,
             return_dict=True,
             return_tensors="pt",
+            **_calibration_chat_template_kwargs(enable_thinking),
         )
 
         input_ids = encoded.get("input_ids")
@@ -1310,7 +1364,9 @@ def main() -> None:
     print(
         f"ready to quantize with {len(calibration_dataset)} mixed calibration samples; "
         f"target_language={TARGET_LANGUAGE}, text_pattern={TEXT_LANGUAGE_PATTERN}, "
-        f"vqa_prompt_pattern={VQA_PROMPT_PATTERN}, coco_prompt_pattern={COCO_PROMPT_PATTERN}"
+        f"vqa_prompt_pattern={VQA_PROMPT_PATTERN}, coco_prompt_pattern={COCO_PROMPT_PATTERN}, "
+        f"calibration_enable_thinking={CALIBRATION_ENABLE_THINKING}, "
+        f"no_thinking_calib_ratio={NO_THINKING_CALIB_RATIO}"
     )
 
     dynamic_quant_config = _build_dynamic_quant_config()
