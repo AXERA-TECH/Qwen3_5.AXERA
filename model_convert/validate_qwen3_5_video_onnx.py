@@ -34,9 +34,12 @@ def parse_args():
     parser.add_argument("--frame-pattern", default="*.jpg", help="Glob pattern for frame files")
     parser.add_argument("--prompt", default="请描述这个视频中的内容")
     parser.add_argument(
-        "--static-tensors-path",
-        default="vision_static_tensors.pth",
-        help="Path to static tensor file saved during ONNX export (used to align video grid to static ONNX shape).",
+        "--image-size",
+        nargs=2,
+        type=int,
+        default=(384, 384),
+        metavar=("WIDTH", "HEIGHT"),
+        help="Frame size used by the fixed-shape ONNX model (default: 384 384).",
     )
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Generation length")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -46,16 +49,16 @@ def parse_args():
         help="Enable internal processor frame sampling. By default, all provided frames are used.",
     )
     parser.add_argument(
-        "--align-to-static-grid",
+        "--align-to-onnx-shape",
         action="store_true",
         default=True,
-        help="Align frame count/resolution to static export grid from --static-tensors-path (default: enabled).",
+        help="Align frame count/resolution to the fixed ONNX input shape (default: enabled).",
     )
     parser.add_argument(
-        "--no-align-to-static-grid",
+        "--no-align-to-onnx-shape",
         action="store_false",
-        dest="align_to_static_grid",
-        help="Disable static-grid alignment and use processor defaults directly.",
+        dest="align_to_onnx_shape",
+        help="Disable ONNX-shape alignment and use processor defaults directly.",
     )
     return parser.parse_args()
 
@@ -133,29 +136,6 @@ def load_frames(frame_paths: list[str], resize_to: tuple[int, int] | None = None
     return frames
 
 
-def _torch_load(path: str):
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
-
-
-def load_static_grid_thw(static_tensors_path: str) -> tuple[int, int, int] | None:
-    if not static_tensors_path or not os.path.exists(static_tensors_path):
-        return None
-    static = _torch_load(static_tensors_path)
-    if "grid_thw" not in static:
-        return None
-    grid = static["grid_thw"]
-    if not torch.is_tensor(grid):
-        grid = torch.tensor(grid, dtype=torch.long)
-    grid = grid.to(dtype=torch.long).reshape(-1, 3)
-    if grid.shape[0] != 1:
-        return None
-    t, h, w = [int(v) for v in grid[0].tolist()]
-    return t, h, w
-
-
 def get_onnx_hidden_states_shape(onnx_path: str) -> tuple[int, int, int, int] | None:
     session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     input_shape = session.get_inputs()[0].shape
@@ -178,32 +158,50 @@ def main():
     print(f"first_frame={frame_paths_all[0]}")
     print(f"last_frame ={frame_paths_all[-1]}")
 
+    expected_hidden_shape = get_onnx_hidden_states_shape(args.onnx_path)
     video_kwargs = {"do_sample_frames": args.do_sample_frames}
     frame_paths_used = list(frame_paths_all)
-    static_grid = load_static_grid_thw(args.static_tensors_path) if args.align_to_static_grid else None
-    if static_grid is not None:
+    if args.align_to_onnx_shape:
+        if expected_hidden_shape is None:
+            raise ValueError("ONNX input must have a fixed 4D hidden_states shape for automatic frame alignment")
         temporal_patch_size = int(processor.video_processor.temporal_patch_size)
         patch_size = int(processor.video_processor.patch_size)
-        target_t, target_h, target_w = static_grid
+        merge_size = int(processor.video_processor.merge_size)
+        image_width, image_height = args.image_size
+        resize_factor = patch_size * merge_size
+        if image_width <= 0 or image_height <= 0:
+            raise ValueError("--image-size values must be positive")
+        if image_width % resize_factor or image_height % resize_factor:
+            raise ValueError(
+                f"--image-size WIDTH and HEIGHT must both be divisible by {resize_factor} "
+                f"(patch_size={patch_size}, merge_size={merge_size})"
+            )
+
+        target_t = expected_hidden_shape[0]
+        target_h = image_height // patch_size
+        target_w = image_width // patch_size
+        expected_seq_len = target_h * target_w
+        expected_tpp = temporal_patch_size * patch_size * patch_size
+        if expected_hidden_shape[2] != expected_seq_len or expected_hidden_shape[3] != expected_tpp:
+            raise ValueError(
+                f"--image-size {image_width} {image_height} implies hidden_states shape "
+                f"[T, C, {expected_seq_len}, {expected_tpp}], but ONNX expects {expected_hidden_shape}"
+            )
+
+        target_grid = (target_t, target_h, target_w)
         target_raw_frames = target_t * temporal_patch_size
-        target_size = (target_w * patch_size, target_h * patch_size)
+        target_size = (image_width, image_height)
         frame_paths_used = sample_frame_paths(frame_paths_all, target_raw_frames)
         frames = load_frames(frame_paths_used, resize_to=target_size)
         video_kwargs = {"do_sample_frames": False, "do_resize": False}
         print(
-            "align_to_static_grid=True "
-            f"grid_thw={list(static_grid)} raw_frames={target_raw_frames} "
+            "align_to_onnx_shape=True "
+            f"grid_thw={list(target_grid)} raw_frames={target_raw_frames} "
             f"frame_size={target_size[0]}x{target_size[1]}"
         )
     else:
         frames = load_frames(frame_paths_used)
-        if args.align_to_static_grid:
-            print(
-                "align_to_static_grid=True but static grid is unavailable; "
-                "falling back to direct processor preprocessing."
-            )
-        else:
-            print("align_to_static_grid=False")
+        print("align_to_onnx_shape=False")
 
     print(f"num_used_frames={len(frame_paths_used)}")
     print(f"used_first_frame={frame_paths_used[0]}")
@@ -243,12 +241,11 @@ def main():
     print(f"torch pixel_values_videos shape={tuple(inputs_torch['pixel_values_videos'].shape)}")
     print(f"onnx  pixel_values_videos shape={tuple(inputs_onnx['pixel_values_videos'].shape)}")
     print(f"video_grid_thw={inputs_torch['video_grid_thw'].tolist()}")
-    expected_hidden_shape = get_onnx_hidden_states_shape(args.onnx_path)
     if expected_hidden_shape is not None and tuple(inputs_onnx["pixel_values_videos"].shape) != expected_hidden_shape:
         raise ValueError(
             "Prepared ONNX hidden_states shape does not match model input shape: "
             f"prepared={tuple(inputs_onnx['pixel_values_videos'].shape)}, expected={expected_hidden_shape}. "
-            "Use --align-to-static-grid with a matching --static-tensors-path or regenerate ONNX for this video grid."
+            "Use --align-to-onnx-shape with a matching --image-size or regenerate ONNX for this video grid."
         )
 
     num_video_tokens = int((inputs_torch["input_ids"] == processor.video_token_id).sum().item())

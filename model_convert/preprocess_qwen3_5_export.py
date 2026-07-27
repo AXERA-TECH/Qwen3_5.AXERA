@@ -61,14 +61,29 @@ class Qwen2VLImageProcessorExport(Qwen2VLImageProcessor):
         resized_height, resized_width = height, width
         processed_images = []
 
+        # transformers<=4.x exposed min_pixels/max_pixels directly, while
+        # newer image processors keep them under size. Support both layouts
+        # because this export helper intentionally subclasses the legacy
+        # Qwen2-VL processor implementation.
+        min_pixels = getattr(self, "min_pixels", None)
+        max_pixels = getattr(self, "max_pixels", None)
+        if min_pixels is None:
+            min_pixels = getattr(self.size, "shortest_edge", None)
+        if max_pixels is None:
+            max_pixels = getattr(self.size, "longest_edge", None)
+        if min_pixels is None:
+            min_pixels = self.size["shortest_edge"]
+        if max_pixels is None:
+            max_pixels = self.size["longest_edge"]
+
         for image in images:
             if do_resize:
                 resized_height, resized_width = smart_resize(
                     height,
                     width,
                     factor=self.patch_size * self.merge_size,
-                    min_pixels=self.min_pixels,
-                    max_pixels=self.max_pixels,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
                 )
                 image = resize(
                     image,

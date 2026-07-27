@@ -17,6 +17,7 @@ model_convert/
 ├── export_qwen3_5_vision_onnx.py          # 导出 Qwen3.5 Vision Encoder ONNX
 ├── modeling_qwen3_5_export.py             # 为导出/ONNX 替换重载 Qwen3.5 模型类
 ├── preprocess_qwen3_5_export.py           # 导出用图像预处理与 NCHW 输入整理
+├── get_image_calib.py                      # 生成 Vision Encoder PTQ 校准数据和 tar 包
 ├── validate_qwen3_5_vision_onnx.py        # 图像输入下对比 Torch 与 ONNX
 ├── validate_qwen3_5_video_onnx.py         # 视频帧输入下对比 Torch 与 ONNX
 ├── compare_qwen3_5_vision_onnx_axmodel.py # 对比 ONNX 与 AXModel 仿真输出
@@ -24,6 +25,7 @@ model_convert/
 ├── build_llm_0.8b.sh                      # 0.8B Language Model 编译示例
 ├── build_llm_2b.sh                        # 2B Language Model 编译示例
 ├── build_llm_4b.sh                        # 4B Language Model 编译示例
+├── build_llm_longctx.sh                   # 长上下文、多子图编译示例
 ├── config.json                            # Vision Encoder Pulsar2 量化/编译配置
 ├── tools/embed_process.sh                 # embedding 导出与 bf16 转换入口
 ├── tools/extract_embed.py                 # 从 HF 模型提取 embed_tokens 权重
@@ -117,35 +119,24 @@ NUM_CALIB=256 NUM_COCO_CALIB=128 python apply_gptq.py
 
 ## 二、导出 Vision Encoder ONNX
 
-`export_qwen3_5_vision_onnx.py` 会把 Vision Encoder 导出为固定输入形状的 ONNX。导出时会把和 `grid_thw` 相关的静态张量提前保存到 `vision_static_tensors.pth`，并重载视觉模型 forward 以适配 NCHW 输入。
+`export_qwen3_5_vision_onnx.py` 会把 Vision Encoder 导出为固定输入形状的 ONNX。通过 `--image-size WIDTH HEIGHT` 指定输入图片尺寸，脚本会自动计算 `grid_thw`，在内存中生成相关静态张量并直接固化到 ONNX。
 
-使用图片自动计算 `grid_thw`：
+导出固定 `384×384` 输入的模型：
 
 ```bash
 python export_qwen3_5_vision_onnx.py \
   --model-path ../../Qwen/Qwen3.5-2B/ \
+  --image-size 384 384 \
   --image-path demo.jpeg \
-  --onnx-output qwen3_5_vision.onnx \
-  --static-tensors-output vision_static_tensors.pth
-```
-
-或者手动指定固定网格：
-
-```bash
-python export_qwen3_5_vision_onnx.py \
-  --model-path ../../Qwen/Qwen3.5-2B/ \
-  --grid-thw 1 24 24 \
-  --onnx-output qwen3_5_vision.onnx \
-  --static-tensors-output vision_static_tensors.pth
+  --onnx-output qwen3_5_vision.onnx
 ```
 
 常用参数：
 
 - `--model-path`：HuggingFace 模型目录。
-- `--image-path`：用于自动计算 `grid_thw` 和导出输入 shape 的图片。
-- `--grid-thw T H W`：手动指定固定导出网格。
+- `--image-size WIDTH HEIGHT`：固定输入图片尺寸，宽和高必须是 `patch_size × merge_size` 的整数倍；默认 `384 384`。
+- `--image-path`：可选的导出样例图片；脚本会将其缩放到 `--image-size`。
 - `--onnx-output`：ONNX 输出路径。
-- `--static-tensors-output`：静态张量输出路径，视频 ONNX 校验也会用到。
 - `--hidden-states`：可选，传入 `.pth` 输入张量，否则使用图片预处理结果或随机张量。
 
 导出完成后脚本会执行 `onnx.checker`、shape inference 和 `onnxsim.simplify`。
@@ -159,6 +150,7 @@ python validate_qwen3_5_vision_onnx.py \
   --model-path ../../Qwen/Qwen3.5-2B/ \
   --onnx-path qwen3_5_vision.onnx \
   --image-path demo.jpeg \
+  --image-size 384 384 \
   --prompt "描述这张图片" \
   --max-new-tokens 64
 ```
@@ -170,7 +162,7 @@ python validate_qwen3_5_video_onnx.py \
   --model-path ../../Qwen/Qwen3.5-2B/ \
   --onnx-path qwen3_5_vision.onnx \
   --video-frames-dir video-test-03 \
-  --static-tensors-path vision_static_tensors.pth \
+  --image-size 384 384 \
   --prompt "请描述这个视频中的内容"
 ```
 
@@ -185,6 +177,44 @@ python validate_qwen3_5_video_onnx.py \
 - 模型输入处理：`BGR` + `NCHW`
 - 校准集：`calib_img/hidden_states.tar`
 - 目标硬件：`AX650`
+
+### 1. 生成 PTQ 校准数据集
+
+校准数据的 `--image-size` 必须和导出 ONNX 时完全一致。`get_image_calib.py` 会复用导出路径的图像预处理，把原始图片转换为 Vision Encoder 的未归一化 `hidden_states` patch-grid，并自动打包为 `config.json` 所需的 `calib_img/hidden_states.tar`。
+
+请准备至少 8 张有代表性的图片（场景、亮度、主体尽量多样）；可以直接用视频抽帧作为输入。以下命令生成默认固定网格 `grid_thw=(1, 24, 24)` 的 8 个样本：
+
+```bash
+python get_image_calib.py \
+  --input-dir /path/to/calibration_images \
+  --image-size 384 384 \
+  --num-samples 8 \
+  --output-dir calib_img
+```
+
+需要生成更多样本或使用其他固定图片尺寸时：
+
+```bash
+python get_image_calib.py \
+  --input-dir /path/to/calibration_images \
+  --image-size 512 384 \
+  --num-samples 32 \
+  --output-dir calib_img
+```
+
+`--image-size` 的顺序是 `WIDTH HEIGHT`，宽和高都必须是 `patch_size × merge_size = 32` 的整数倍。脚本按 `grid_thw=(1, HEIGHT/16, WIDTH/16)` 自动计算固定网格，并默认覆盖输出目录中同名的 `h*.jpg`、`hidden_states.tar` 和 `calib_manifest.json`。
+
+脚本会生成 `h0.jpg`、`h1.jpg` 等 patch-grid 文件、`hidden_states.tar` 和记录来源及 shape 的 `calib_manifest.json`。这些 JPEG 是张量的序列化形式，尺寸和视觉内容看起来并不正常；不要再对它们做裁剪、缩放或颜色转换。
+
+对于当前默认的 `--image-size 384 384`、`patch_size=16`、`temporal_patch_size=2`：脚本自动计算 `grid_thw=(1,24,24)`，ONNX 输入 shape 为 `[1, 3, 576, 512]`，生成的校准 JPEG 尺寸为 `512×576`。导出 ONNX 和生成校准数据时必须使用相同的 `--image-size`。同时需要在 `config.json` 中把 `calibration_size` 设为希望使用的样本数（且不大于 tar 包内样本数）。
+
+可检查归档内容：
+
+```bash
+tar -tvf calib_img/hidden_states.tar
+```
+
+### 2. 执行模型转换
 
 编译命令示例：
 
@@ -226,17 +256,18 @@ python compare_qwen3_5_vision_onnx_axmodel.py \
 
 ## 六、编译 Language Model
 
-本目录提供了三个示例脚本：
+本目录提供了四个主要示例脚本：
 
 - `build_llm_0.8b.sh`：0.8B GPTQ Int4 模型。
 - `build_llm_2b.sh`：2B GPTQ Int4 模型。
 - `build_llm_4b.sh`：4B GPTQ Int4 模型。
+- `build_llm_longctx.sh`：多 prefill、多 decode 的长上下文模型。
 
-运行前请检查脚本里的路径和量化 scale 文件：
+运行前请检查脚本里的输入、输出路径和上下文参数：
 
 ```bash
 INPUT_DIR=../../Qwen/Qwen3.5-2B-GPTQ-Int4-0326
-OUTPUT_DIR=../../Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-AX650-GPTQ-Int4-C128-P1152-CTX2047-0326
+OUTPUT_DIR=../../Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-GPTQ-Int4-0326-AX650-C128-P1152-CTX2048
 ```
 
 编译入口示例：
@@ -245,16 +276,34 @@ OUTPUT_DIR=../../Qwen3_5.AXERA/ax-llm/Qwen3.5-2B-AX650-GPTQ-Int4-C128-P1152-CTX2
 bash build_llm_2b.sh
 ```
 
-核心 `pulsar2 llm_build` 参数含义：
+脚本统一使用 `pulsar2 llm_build2`。一个 prefill 总长度为 1152、chunk 为 128、最长上下文为 2048 的示例为：
 
-- `--kv_cache_len 2047`：KV cache 最大长度。
+```bash
+export FLOAT_MATMUL_USE_CONV_EU=1
+pulsar2 llm_build2 --input_path "$INPUT_DIR" \
+  --output_path "$OUTPUT_DIR" \
+  --hidden_state_type bf16 \
+  --prefill_len 1152 \
+  --prefill_step_size 128 \
+  --max_context 2048 \
+  --chip AX650 \
+  --parallel 8
+```
+
+核心参数含义：
+
+- `--prefill_len`：模型包需要覆盖的 prefill 总长度。
+- `--prefill_step_size`：每个 prefill 子图的 token 数，也就是 chunk 长度，通常使用 64、128、256 等 2 的幂。未指定时，`llm_build2` 会根据 `prefill_len` 自动选择：不超过 512 使用 64，不超过 2048 使用 128，更长使用 256。
+- `--max_context`：最大 decode attention 长度，应大于 prefill 总长度；底层最大 `kv_cache_len` 会自动生成成 `max_context - 1`。
+- `--decode_step_size`：decode 上下文拆分步长。小于等于 0 表示只生成一个 decode 子图；未指定时，`max_context <= 2048` 使用单子图，更长上下文默认按 2048 拆分。
 - `--hidden_state_type bf16`：hidden state 使用 bf16。
-- `--prefill_len 128`：基础 prefill 分块长度。
-- `--last_kv_cache_len ...`：生成多个 prefill 分组，最大值决定单次 prefill 支持的最大 token 数。
 - `--chip AX650`：目标芯片。
 - `--parallel 8`：并行编译进程数，按机器资源调整。
-- `--linear_conv_scale_mode use` / `--linear_conv_scale_file`：使用已生成的 linear conv scale 文件。
-- `--linear_attn_chunk_size 32`：linear attention 编译分块大小。
+
+
+Qwen3.5 的 Language Model 使用 `qwen3_5_text` 适配，Vision Encoder 在前述章节中单独编译，因此这些脚本不传通用的 `--image_size`；视觉输入尺寸由 ONNX/AXModel 的 `--image-size` 流程控制。
+
+输出目录按 `{原始模型名}-{chip}-C{prefill_step_size}-P{prefill_len}-CTX{max_context}` 命名，例如 `Qwen3.5-0.8B-GPTQ-Int4-AX650-C128-P1280-CTX2048`。
 
 编译完成后，脚本会调用：
 

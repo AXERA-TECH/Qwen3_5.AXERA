@@ -5,7 +5,7 @@ import sys
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageOps
 
 TRANSFORMERS_SRC = os.environ.get("TRANSFORMERS_SRC", "/data/tmp/yongqiang/nfs/lhj/transformers/src")
 if TRANSFORMERS_SRC not in sys.path:
@@ -29,6 +29,14 @@ def parse_args():
     )
     parser.add_argument("--onnx-path", default="qwen3_5_vision.onnx")
     parser.add_argument("--image-path", default="/home/lihongjie/AI-support/npu-codebase/RealWorld-04_384x384.png")
+    parser.add_argument(
+        "--image-size",
+        nargs=2,
+        type=int,
+        default=(384, 384),
+        metavar=("WIDTH", "HEIGHT"),
+        help="Image size used by the fixed-shape ONNX model (default: 384 384).",
+    )
     parser.add_argument("--prompt", default="这是哪里")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Generation length")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -84,7 +92,24 @@ def main():
     print("[1/6] load processor")
     processor = AutoProcessor.from_pretrained(args.model_path)
 
-    image = Image.open(args.image_path).convert("RGB")
+    image_size = tuple(args.image_size)
+    image_width, image_height = image_size
+    patch_size = int(processor.image_processor.patch_size)
+    merge_size = int(processor.image_processor.merge_size)
+    resize_factor = patch_size * merge_size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("--image-size values must be positive")
+    if image_width % resize_factor or image_height % resize_factor:
+        raise ValueError(
+            f"--image-size WIDTH and HEIGHT must both be divisible by {resize_factor} "
+            f"(patch_size={patch_size}, merge_size={merge_size})"
+        )
+
+    with Image.open(args.image_path) as source_image:
+        image = ImageOps.exif_transpose(source_image).convert("RGB")
+        image = image.resize(image_size, Image.Resampling.BICUBIC)
+    expected_grid_thw = [1, image_height // patch_size, image_width // patch_size]
+    print(f"image_size={image_size}, expected grid_thw={expected_grid_thw}")
 
     messages = [
         {
@@ -103,6 +128,12 @@ def main():
         return_tensors="pt",
     )
     inputs_torch = inputs_torch.to(device)
+    actual_grid_thw = inputs_torch["image_grid_thw"].reshape(-1).tolist()
+    if actual_grid_thw != expected_grid_thw:
+        raise ValueError(
+            f"processor produced image_grid_thw={actual_grid_thw}, expected {expected_grid_thw} "
+            "from --image-size"
+        )
 
     # Keep HF-native vision layout for torch baseline; derive ONNX NCHW input by re-layout from HF pixel_values.
     pixel_values_nchw = hf_pixel_values_to_nchw(
@@ -143,6 +174,15 @@ def main():
     ).eval()
     model_onnx.model.visual.init_onnx_session(args.onnx_path, providers=["CPUExecutionProvider"])
     model_onnx.model.visual.forward = model_onnx.model.visual.forward_onnx_nchw
+    onnx_input_shape = model_onnx.model.visual.session.get_inputs()[0].shape
+    prepared_input_shape = tuple(inputs_onnx["pixel_values"].shape)
+    if len(onnx_input_shape) == 4 and all(isinstance(value, int) for value in onnx_input_shape):
+        expected_input_shape = tuple(int(value) for value in onnx_input_shape)
+        if prepared_input_shape != expected_input_shape:
+            raise ValueError(
+                f"prepared hidden_states shape {prepared_input_shape} does not match ONNX input "
+                f"shape {expected_input_shape}; use the same --image-size as ONNX export"
+            )
 
     print("[4/6] compare vision features")
     with torch.no_grad():

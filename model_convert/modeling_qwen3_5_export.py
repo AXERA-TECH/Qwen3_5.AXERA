@@ -1,6 +1,3 @@
-import os
-from typing import Any
-
 import onnxruntime as ort
 import torch
 import torch.nn.functional as F
@@ -14,13 +11,6 @@ except ImportError:  # fallback for environments that do not expose these at tra
         Qwen3_5Model,
         Qwen3_5VisionModel,
     )
-
-
-def _torch_load(path: str) -> Any:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
 
 
 def to_grid_thw_tensor(grid_thw: torch.Tensor | list[int] | tuple[int, int, int]) -> torch.Tensor:
@@ -60,38 +50,20 @@ def compute_static_vision_tensors(vision_model: Qwen3_5VisionModel, grid_thw: to
     }
 
 
-@torch.no_grad()
-def save_static_vision_tensors(
-    model_path: str,
-    grid_thw: torch.Tensor | list[int] | tuple[int, int, int],
-    output_path: str,
-    dtype: torch.dtype = torch.float32,
-) -> None:
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        model_path,
-        torch_dtype=dtype,
-        device_map="cpu",
-    )
-    model.eval()
-    static_tensors = compute_static_vision_tensors(model.model.visual, to_grid_thw_tensor(grid_thw))
-    torch.save(static_tensors, output_path)
-
-
 class Qwen3_5VisionModelExport(Qwen3_5VisionModel):
-    def __init__(self, config, *inputs, static_tensors_path: str | None = None, **kwargs) -> None:
+    def __init__(self, config, *inputs, **kwargs) -> None:
         super().__init__(config, *inputs, **kwargs)
         self.static_pos_embeds = None
         self.static_position_cos = None
         self.static_position_sin = None
         self.static_cu_seqlens = None
         self.static_grid_thw = None
-        if static_tensors_path:
-            self.load_static_tensors(static_tensors_path)
 
-    def load_static_tensors(self, static_tensors_path: str) -> None:
-        if not os.path.exists(static_tensors_path):
-            raise FileNotFoundError(f"static tensor file not found: {static_tensors_path}")
-        static = _torch_load(static_tensors_path)
+    def set_static_tensors(self, static: dict[str, torch.Tensor]) -> None:
+        required = {"grid_thw", "pos_embeds", "position_cos", "position_sin", "cu_seqlens"}
+        missing = required.difference(static)
+        if missing:
+            raise KeyError(f"static tensors are missing required keys: {sorted(missing)}")
         self.static_pos_embeds = static["pos_embeds"].to("cpu")
         self.static_position_cos = static["position_cos"].to("cpu")
         self.static_position_sin = static["position_sin"].to("cpu")
@@ -100,7 +72,7 @@ class Qwen3_5VisionModelExport(Qwen3_5VisionModel):
 
     def forward_export_nchw(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.static_pos_embeds is None:
-            raise RuntimeError("static tensors are not loaded. Call `load_static_tensors` before export forward.")
+            raise RuntimeError("static tensors are not initialized. Call `set_static_tensors` before export forward.")
         if hidden_states.ndim != 4:
             raise ValueError(
                 "export input must be 4D tensor in layout [t, c, seq, tpp], "
@@ -137,20 +109,18 @@ class Qwen3_5VisionModelExport(Qwen3_5VisionModel):
 
 
 class Qwen3_5ModelExport(Qwen3_5Model):
-    def __init__(self, config, static_tensors_path: str | None = None):
+    def __init__(self, config):
         super().__init__(config)
         config.vision_config._attn_implementation = "eager"
         self.visual = Qwen3_5VisionModelExport._from_config(
             config.vision_config,
         )
-        if static_tensors_path:
-            self.visual.load_static_tensors(static_tensors_path)
 
 
 class Qwen3_5ForConditionalGenerationExport(Qwen3_5ForConditionalGeneration):
-    def __init__(self, config, static_tensors_path: str | None = None):
+    def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3_5ModelExport(config, static_tensors_path=static_tensors_path)
+        self.model = Qwen3_5ModelExport(config)
 
 
 class Qwen3_5VisionModelONNX(Qwen3_5VisionModel):

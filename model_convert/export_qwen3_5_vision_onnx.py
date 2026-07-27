@@ -6,7 +6,7 @@ import onnx
 from onnx.shape_inference import infer_shapes
 import onnxsim
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 TRANSFORMERS_SRC = os.environ.get("TRANSFORMERS_SRC", "/data/tmp/yongqiang/nfs/lhj/transformers/src")
 if TRANSFORMERS_SRC not in sys.path:
@@ -19,18 +19,16 @@ try:
 except ImportError:
     from transformers import AutoProcessor
 
-from modeling_qwen3_5_export import Qwen3_5ForConditionalGenerationExport, save_static_vision_tensors
+from modeling_qwen3_5_export import Qwen3_5ForConditionalGenerationExport, compute_static_vision_tensors
 
 
-def build_export_image_processor(processor):
+def build_export_image_processor(processor, image_size):
     src = processor.image_processor
-    if hasattr(src, "size") and isinstance(src.size, dict):
-        size = {"shortest_edge": int(src.size["shortest_edge"]), "longest_edge": int(src.size["longest_edge"])}
-    else:
-        size = {"shortest_edge": 56 * 56, "longest_edge": 28 * 28 * 1280}
+    image_width, image_height = image_size
+    image_pixels = image_width * image_height
 
     return Qwen2VLImageProcessorExport(
-        size=size,
+        size={"shortest_edge": image_pixels, "longest_edge": image_pixels},
         patch_size=int(src.patch_size),
         temporal_patch_size=int(src.temporal_patch_size),
         merge_size=int(src.merge_size),
@@ -40,34 +38,29 @@ def build_export_image_processor(processor):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export Qwen3.5 vision encoder to ONNX (fixed image grid).")
+    parser = argparse.ArgumentParser(description="Export Qwen3.5 vision encoder to ONNX (fixed image size).")
     parser.add_argument(
         "--model-path",
         default="/data/tmp/yongqiang/nfs/lhj/Qwen/Qwen3.5-4B/",
         help="HuggingFace model directory",
     )
     parser.add_argument(
-        "--grid-thw",
-        nargs=3,
+        "--image-size",
+        nargs=2,
         type=int,
-        default=None,
-        metavar=("T", "H", "W"),
-        help="Fixed grid_thw for export. If not set, it will be auto-computed from --image-path.",
+        default=(384, 384),
+        metavar=("WIDTH", "HEIGHT"),
+        help="Fixed input image size used to derive grid_thw (default: 384 384).",
     )
     parser.add_argument(
         "--image-path",
         default="",
-        help="Optional image path used to auto-compute grid_thw and (by default) export input tensor.",
+        help="Optional image used as export input data; it is resized to --image-size.",
     )
     parser.add_argument(
         "--onnx-output",
         default="qwen3_5_4b_vision.onnx",
         help="Output ONNX path",
-    )
-    parser.add_argument(
-        "--static-tensors-output",
-        default="vision_static_tensors.pth",
-        help="Output path for precomputed static tensors",
     )
     parser.add_argument(
         "--hidden-states",
@@ -82,39 +75,54 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if args.grid_thw is None and not args.image_path:
-        raise ValueError("Either --grid-thw or --image-path must be provided.")
+    image_size = tuple(args.image_size)
+    image_width, image_height = image_size
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("--image-size values must be positive")
+
+    processor = AutoProcessor.from_pretrained(args.model_path)
+    src_image_processor = processor.image_processor
+    patch_size = int(src_image_processor.patch_size)
+    merge_size = int(src_image_processor.merge_size)
+    resize_factor = patch_size * merge_size
+    if image_width % resize_factor or image_height % resize_factor:
+        raise ValueError(
+            f"--image-size WIDTH and HEIGHT must both be divisible by {resize_factor} "
+            f"(patch_size={patch_size}, merge_size={merge_size})"
+        )
+
+    grid_thw = torch.tensor(
+        [1, image_height // patch_size, image_width // patch_size], dtype=torch.long
+    ).reshape(1, 3)
+    print(f"image_size={image_size}, derived grid_thw={grid_thw.reshape(-1).tolist()}")
 
     hidden_states_from_image = None
     if args.image_path:
-        processor = AutoProcessor.from_pretrained(args.model_path)
-        export_image_processor = build_export_image_processor(processor)
-        image = Image.open(args.image_path).convert("RGB")
+        export_image_processor = build_export_image_processor(processor, image_size)
+        with Image.open(args.image_path) as source_image:
+            image = ImageOps.exif_transpose(source_image).convert("RGB")
+            image = image.resize(image_size, Image.Resampling.BICUBIC)
         pixel_values_nchw, image_grid_thw = preprocess_image_to_nchw(image, export_image_processor)
+        if not torch.equal(image_grid_thw, grid_thw):
+            raise RuntimeError(
+                f"image preprocessing produced grid_thw={image_grid_thw.reshape(-1).tolist()}, "
+                f"expected {grid_thw.reshape(-1).tolist()} from --image-size"
+            )
         hidden_states_from_image = pixel_values_nchw.to(torch.float32)
-    else:
-        image_grid_thw = None
 
-    if args.grid_thw is not None:
-        grid_thw = torch.tensor(args.grid_thw, dtype=torch.long).reshape(1, 3)
-    else:
-        grid_thw = image_grid_thw
-    print(f"using grid_thw={grid_thw.reshape(-1).tolist()}")
-
-    print(f"[1/4] precompute static tensors -> {args.static_tensors_output}")
-    save_static_vision_tensors(args.model_path, grid_thw, args.static_tensors_output, dtype=torch.float32)
-
-    print("[2/4] load export model")
+    print("[1/4] load export model")
     model = Qwen3_5ForConditionalGenerationExport.from_pretrained(
         args.model_path,
         torch_dtype=torch.float32,
         device_map="cpu",
-        static_tensors_path=None,
     )
     model.eval()
     export_model = model.model.visual
-    export_model.load_static_tensors(args.static_tensors_output)
     export_model.eval()
+
+    print("[2/4] compute fixed-shape tensors in memory")
+    static_tensors = compute_static_vision_tensors(export_model, grid_thw)
+    export_model.set_static_tensors(static_tensors)
     export_model.forward = export_model.forward_export_nchw
 
     t, h, w = [int(v) for v in grid_thw.reshape(-1).tolist()]
@@ -148,6 +156,7 @@ def main():
         input_names=["hidden_states"],
         output_names=["pooler_output"],
         opset_version=args.opset,
+        dynamo=False,
     )
 
     print("[4/4] check onnx graph")
